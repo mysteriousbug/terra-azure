@@ -1,0 +1,279 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Environment to deploy'
+        )
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Terraform action to perform'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto approve terraform apply (use with caution)'
+        )
+    }
+    
+    environment {
+        // Azure credentials
+        ARM_CLIENT_ID = credentials('azure-client-id')
+        ARM_CLIENT_SECRET = credentials('azure-client-secret')
+        ARM_SUBSCRIPTION_ID = credentials('azure-subscription-id')
+        ARM_TENANT_ID = credentials('azure-tenant-id')
+        
+        // Terraform variables
+        TF_VAR_environment = "${params.ENVIRONMENT}"
+        TF_VAR_project_name = 'webapp'
+        TF_VAR_location = 'East US'
+        TF_VAR_owner = 'DevOps Team'
+        
+        // State backend configuration
+        TF_STATE_RESOURCE_GROUP = 'terraform-state-rg'
+        TF_STATE_STORAGE_ACCOUNT = 'terraformstate${BUILD_NUMBER}'
+        TF_STATE_CONTAINER = 'tfstate'
+        
+        // Tools
+        TERRAFORM_VERSION = '1.6.0'
+        CHECKOV_VERSION = '2.4.0'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+        
+        stage('Setup Tools') {
+            steps {
+                script {
+                    // Install Terraform
+                    sh """
+                        wget -O terraform.zip https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                        unzip terraform.zip
+                        sudo mv terraform /usr/local/bin/
+                        terraform --version
+                    """
+                    
+                    // Install Checkov for security scanning
+                    sh """
+                        pip3 install checkov==${CHECKOV_VERSION}
+                        checkov --version
+                    """
+                }
+            }
+        }
+        
+        stage('Validate Environment') {
+            steps {
+                script {
+                    // Set environment-specific variables
+                    switch(params.ENVIRONMENT) {
+                        case 'dev':
+                            env.TF_VAR_app_service_sku = jsonEncode([tier: 'Free', size: 'F1'])
+                            env.TF_VAR_database_config = jsonEncode([
+                                sku_name: 'B_Gen5_1',
+                                storage_mb: 5120,
+                                backup_retention_days: 7,
+                                geo_redundant_backup_enabled: false,
+                                auto_grow_enabled: true,
+                                version: '13'
+                            ])
+                            break
+                        case 'staging':
+                            env.TF_VAR_app_service_sku = jsonEncode([tier: 'Standard', size: 'S1'])
+                            env.TF_VAR_database_config = jsonEncode([
+                                sku_name: 'GP_Gen5_2',
+                                storage_mb: 10240,
+                                backup_retention_days: 14,
+                                geo_redundant_backup_enabled: true,
+                                auto_grow_enabled: true,
+                                version: '13'
+                            ])
+                            break
+                        case 'prod':
+                            env.TF_VAR_app_service_sku = jsonEncode([tier: 'Premium', size: 'P1v3'])
+                            env.TF_VAR_database_config = jsonEncode([
+                                sku_name: 'GP_Gen5_4',
+                                storage_mb: 20480,
+                                backup_retention_days: 30,
+                                geo_redundant_backup_enabled: true,
+                                auto_grow_enabled: true,
+                                version: '13'
+                            ])
+                            break
+                    }
+                    
+                    echo "Deploying to environment: ${params.ENVIRONMENT}"
+                    echo "Terraform action: ${params.ACTION}"
+                }
+            }
+        }
+        
+        stage('Terraform Format Check') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform fmt -check -recursive'
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            steps {
+                dir('terraform') {
+                    script {
+                        sh """
+                            checkov -d . --framework terraform \
+                                --output cli --output junitxml \
+                                --output-file-path console,checkov-report.xml \
+                                --skip-check CKV_AZURE_109,CKV_AZURE_110 \
+                                --quiet
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'terraform/checkov-report.xml'
+                }
+            }
+        }
+        
+        stage('Terraform Init') {
+            steps {
+                dir('terraform') {
+                    script {
+                        sh """
+                            terraform init \
+                                -backend-config="resource_group_name=${TF_STATE_RESOURCE_GROUP}" \
+                                -backend-config="storage_account_name=${TF_STATE_STORAGE_ACCOUNT}" \
+                                -backend-config="container_name=${TF_STATE_CONTAINER}" \
+                                -backend-config="key=${params.ENVIRONMENT}.tfstate"
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Validate') {
+            steps {
+                dir('terraform') {
+                    sh 'terraform validate'
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            when {
+                anyOf {
+                    expression { params.ACTION == 'plan' }
+                    expression { params.ACTION == 'apply' }
+                }
+            }
+            steps {
+                dir('terraform') {
+                    script {
+                        sh """
+                            terraform plan \
+                                -var-file="environments/${params.ENVIRONMENT}/terraform.tfvars" \
+                                -out=tfplan-${params.ENVIRONMENT} \
+                                -detailed-exitcode
+                        """
+                        
+                        // Archive the plan file
+                        archiveArtifacts artifacts: "tfplan-${params.ENVIRONMENT}", allowEmptyArchive: false
+                    }
+                }
+            }
+        }
+        
+        stage('Manual Approval') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'apply' }
+                    expression { !params.AUTO_APPROVE }
+                    anyOf {
+                        expression { params.ENVIRONMENT == 'staging' }
+                        expression { params.ENVIRONMENT == 'prod' }
+                    }
+                }
+            }
+            steps {
+                script {
+                    def userInput = input(
+                        id: 'Proceed',
+                        message: "Apply Terraform changes to ${params.ENVIRONMENT}?",
+                        parameters: [
+                            choice(
+                                name: 'PROCEED',
+                                choices: 'no\nyes',
+                                description: 'Proceed with deployment?'
+                            )
+                        ]
+                    )
+                    
+                    if (userInput != 'yes') {
+                        error("Deployment cancelled by user")
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Apply') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                dir('terraform') {
+                    script {
+                        if (params.AUTO_APPROVE || params.ENVIRONMENT == 'dev') {
+                            sh "terraform apply -auto-approve tfplan-${params.ENVIRONMENT}"
+                        } else {
+                            sh "terraform apply tfplan-${params.ENVIRONMENT}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Destroy') {
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+            steps {
+                dir('terraform') {
+                    script {
+                        def userInput = input(
+                            id: 'DestroyConfirm',
+                            message: "Are you sure you want to destroy ${params.ENVIRONMENT}?",
+                            parameters: [
+                                string(name: 'CONFIRM', defaultValue: '', description: 'Type "destroy" to confirm')
+                            ]
+                        )
+                        
+                        if (userInput != 'destroy') {
+                            error("Destroy cancelled - confirmation not provided")
+                        }
+                        
+                        sh """
+                            terraform destroy \
+                                -var-file="environments/${params.ENVIRONMENT}/terraform.tfvars" \
+                                -auto-approve
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Health Check') {
