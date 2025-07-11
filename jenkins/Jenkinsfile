@@ -277,3 +277,151 @@ pipeline {
         }
         
         stage('Health Check') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    // Wait for deployment to complete
+                    sleep(time: 30, unit: 'SECONDS')
+                    
+                    // Get outputs from Terraform
+                    def outputs = sh(
+                        script: 'cd terraform && terraform output -json',
+                        returnStdout: true
+                    ).trim()
+                    
+                    def outputsJson = readJSON text: outputs
+                    def appServiceUrl = outputsJson.app_service_url.value
+                    
+                    // Health check
+                    timeout(time: 5, unit: 'MINUTES') {
+                        waitUntil {
+                            script {
+                                try {
+                                    def response = httpRequest(
+                                        url: "${appServiceUrl}/health",
+                                        timeout: 30,
+                                        validResponseCodes: '200'
+                                    )
+                                    return response.status == 200
+                                } catch (Exception e) {
+                                    echo "Health check failed: ${e.message}"
+                                    return false
+                                }
+                            }
+                        }
+                    }
+                    
+                    echo "✅ Health check passed for ${params.ENVIRONMENT}"
+                }
+            }
+        }
+        
+        stage('Integration Tests') {
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+            steps {
+                script {
+                    // Run integration tests
+                    sh """
+                        cd tests
+                        npm install
+                        ENVIRONMENT=${params.ENVIRONMENT} npm run test:integration
+                    """
+                }
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: 'tests/test-results.xml'
+                }
+            }
+        }
+        
+        stage('Performance Tests') {
+            when {
+                allOf {
+                    expression { params.ACTION == 'apply' }
+                    anyOf {
+                        expression { params.ENVIRONMENT == 'staging' }
+                        expression { params.ENVIRONMENT == 'prod' }
+                    }
+                }
+            }
+            steps {
+                script {
+                    // Run performance tests with k6
+                    sh """
+                        cd tests
+                        docker run --rm -v \$(pwd):/workspace -w /workspace \
+                            grafana/k6 run performance/load-test.js
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up
+            sh 'rm -f terraform.zip'
+            
+            // Archive Terraform files
+            archiveArtifacts artifacts: 'terraform/**/*.tf', allowEmptyArchive: true
+            archiveArtifacts artifacts: 'terraform/**/*.tfvars', allowEmptyArchive: true
+        }
+        
+        success {
+            script {
+                if (params.ACTION == 'apply') {
+                    // Send success notification
+                    slackSend(
+                        channel: '#deployments',
+                        color: 'good',
+                        message: """
+                        ✅ *Deployment Successful*
+                        Environment: `${params.ENVIRONMENT}`
+                        Commit: `${env.GIT_COMMIT_SHORT}`
+                        Build: `${env.BUILD_NUMBER}`
+                        Duration: `${currentBuild.durationString}`
+                        """
+                    )
+                }
+            }
+        }
+        
+        failure {
+            script {
+                // Send failure notification
+                slackSend(
+                    channel: '#deployments',
+                    color: 'danger',
+                    message: """
+                    ❌ *Deployment Failed*
+                    Environment: `${params.ENVIRONMENT}`
+                    Action: `${params.ACTION}`
+                    Commit: `${env.GIT_COMMIT_SHORT}`
+                    Build: `${env.BUILD_NUMBER}`
+                    Logs: ${env.BUILD_URL}console
+                    """
+                )
+            }
+        }
+        
+        unstable {
+            script {
+                slackSend(
+                    channel: '#deployments',
+                    color: 'warning',
+                    message: """
+                    ⚠️ *Deployment Unstable*
+                    Environment: `${params.ENVIRONMENT}`
+                    Action: `${params.ACTION}`
+                    Build: `${env.BUILD_NUMBER}`
+                    """
+                )
+            }
+        }
+    }
+}
